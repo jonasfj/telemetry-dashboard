@@ -3,13 +3,78 @@ try:
     print "Using simplejson for faster json parsing"
 except ImportError:
     import json
-import sys
+from datetime import datetime
+import math, sys
 import telemetryutils
 import jydoop
 import math
 
-
 verbose = True
+
+############################# HistogramAggregator
+
+class HistogramAggregator:
+    """ Object that accumulates a single histogram, ie. it aggregates histograms
+        Format of values is
+        [
+            bucket0,
+            bucket1,
+            ...,
+            bucketN,
+            sum,                # -1, if missing
+            log_sum,            # -1, if missing
+            log_sum_squares,    # -1, if missing
+            sum_squares_lo,     # -1, if missing
+            sum_squares_hi,     # -1, if missing
+            count
+        ]
+        Ie. same format as telemetry-server validated histograms with an extra
+        count field.
+
+        Notice that constructor for this object takes same values as constructed
+        by the dump() method. Hence, dump = aggregator.dump() followed by
+        HistogramAggregator(**dump) will restore the aggregator.
+        (Notice without JSON dumps/loads this is just a shallow copy!)
+
+        Like wise aggregators can be merged:
+        aggregator1.merge(**aggregator2.dump())
+    """
+    def __init__(self, values = [], buildId = "", revision = None):
+        self.values = values
+        self.buildId = buildId
+        self.revision = revision
+
+    def merge(self, values, buildId, revision):
+        # If length of values don't match up, we have two different histograms
+        if len(self.values) != len(values):
+            # Choose the histogram with highest buildId
+            if self.buildId < buildId:
+                self.values = values
+                self.buildId = buildId
+                self.revision = revision
+        else:
+            if self.buildId < buildId:
+                self.values = values
+                self.buildId = buildId
+            for i in xrange(0, len(values) - 6):
+                self.values[i] += values[i]
+            # Entries [-6:-1] may have -1 indicating missing entry
+            for i in xrange(len(values) - 6, len(values) - 1):
+                # Missing entries are indicated with -1, we shouldn't add these up
+                if self.values[i] == -1 and values[i] == -1:
+                    continue
+                self.values[i] += values[i]
+            # Last entry cannot be negative
+            self.values[-1] += values[-1]
+
+    def dump(self):
+        return {
+            'revision':     self.revision,
+            'buildId':      self.buildId,
+            'values':       self.values
+        }
+
+############################## Ugly hacks for simple measures
 
 # Auxiliary method for computing bucket offsets from parameters, it is stolen
 # from histogram_tools.py, though slightly modified...
@@ -40,21 +105,24 @@ def buckets2index_from_ranges(ranges):
     return bucket2index
 
 # Bucket offsets for simple measures
-simple_measures_buckets = (
-                           buckets2index_from_ranges(
-                                            exponential_buckets(1, 30000, 50)),
-                           exponential_buckets(1, 30000, 50)
-                           )
+simple_measures_buckets =   (
+                                buckets2index_from_ranges(
+                                        exponential_buckets(1, 30000, 50)
+                                    ),
+                                    exponential_buckets(1, 30000, 50)
+                            )
 
+
+############################# Jydoop Integration, data extraction
 
 SPECS = "scripts/histogram_specs.json"
-histogram_specs = json.loads(
-    jydoop.getResource(SPECS))
+histogram_specs = json.loads(jydoop.getResource(SPECS))
 
 def map(uid, line, context):
     global histogram_specs
-
     payload = json.loads(line)
+
+    submissionDate = uid[2:10] # or uid[1:9]
     try:
         i = payload['info']
         channel = i.get('appUpdateChannel', "too_old")
@@ -63,9 +131,11 @@ def map(uid, line, context):
         reason = i['reason']
         osVersion = str(i['version'])
         #only care about major versions
-        appVersion = i['appVersion'].split('.')[0]
+        majorVersion = i['appVersion'].split('.')[0]
         arch = i['arch']
-        buildDate = i['appBuildID'][:8]
+        buildId = i['appBuildID']
+        buildDate = buildId[:8]
+        revision = i['revision']
     except (KeyError, IndexError, UnicodeEncodeError):
         if verbose:
             msg = "error while unpacking the payload"
@@ -82,40 +152,52 @@ def map(uid, line, context):
     if OS == "Linux":
         osVersion = osVersion[:3]
 
-    path = (buildDate, reason, appName, OS, osVersion, arch)
-    # Sanitize path
-    for val in path:
+    filterPathBD = (buildDate, reason, appName, OS, osVersion, arch)
+    # Sanitize filterPath
+    for val in filterPathBD:
         if not isinstance(val, basestring) and type(val) in (int, float, long):
             if verbose:
-                print >> sys.stderr, "Found type %s in path" % type(val)
+                print >> sys.stderr, "Found type %s in filterPathBD" % type(val)
             return
 
-    # Sanitize channel and appVersion
-    for val in (channel, appVersion):
+    filterPathSD = (submissionDate, reason, appName, OS, osVersion, arch)
+    # Sanitize filterPath
+    for val in filterPathSD:
         if not isinstance(val, basestring) and type(val) in (int, float, long):
             if verbose:
-                print >> sys.stderr, ("Found type %s in channel or appVersion" %
+                print >> sys.stderr, "Found type %s in filterPathSD" % type(val)
+            return
+
+    # Sanitize channel and majorVersion
+    for val in (channel, majorVersion):
+        if not isinstance(val, basestring) and type(val) in (int, float, long):
+            if verbose:
+                print >> sys.stderr, ("Found type %s in channel or majorVersion" %
                                       type(val))
             return
 
-    histograms = payload.get('histograms', None)
-    if histograms is None:
-        histograms = {}
-        if verbose:
-            msg = "histograms is None in map"
-            print >> sys.stderr, msg
-    for h_name, h_values in histograms.iteritems():
+    bdate = datetime.strptime(buildDate, "%Y%m%d")
+    sdate = datetime.strptime(submissionDate, "%Y%m%d")
+    skip_by_submission_date = True
+    if (sdate - bdate).days < 60:
+        skip_by_submission_date = False
+
+    ######### dimensions and other fields are loaded and sanitized
+
+    for h_name, h_values in payload.get('histograms', {}).iteritems():
         bucket2index = histogram_specs.get(h_name, None)
+        if bucket2index is None and h_name.startswith('STARTUP_'):
+            bucket2index = histogram_specs.get(h_name[8:], None)
         if bucket2index is None:
             if verbose:
-                msg = "bucket2index is None in map"
+                msg = "bucket2index is None in map for %s" % h_name
                 print >> sys.stderr, msg
             continue
         else:
             bucket2index = bucket2index[0]
 
         # most buckets contain 0s, so preallocation is a significant win
-        outarray = [0] * (len(bucket2index) + 4)
+        outarray = [0] * (len(bucket2index) + 6)
 
         index_error = False
         type_error = False
@@ -130,14 +212,13 @@ def map(uid, line, context):
         except AttributeError:
             msg = "h_values was not a dict"
             print >> sys.stderr, msg
-            return
+            continue
         if values is None:
             continue
         for bucket, value in values.iteritems():
             index = bucket2index.get(bucket, None)
             if index is None:
-                #print "%s's does not feature %s bucket in schema"
-                #    % (h_name, bucket)
+                #print "%s's does not feature %s bucket in schema" % (h_name, bucket)
                 index_error = True
                 break
             if type(value) not in (int, long, float):
@@ -169,62 +250,95 @@ def map(uid, line, context):
                        type(histogram_sum))
                 print >> sys.stderr, msg
             continue
-        # if statistics isn't available we just leave the two slots as zeroes
-        if 'sum_squares_hi' in h_values and 'sum_squares_lo' in h_values:
-            outarray[-4] = h_values.get('sum_squares_hi', 0)
-            outarray[-3] = h_values.get('sum_squares_lo', 0)
-        elif 'log_sum' in h_values and 'log_sum_squares' in h_values:
-            outarray[-4] = h_values.get('log_sum', 0)
-            outarray[-3] = h_values.get('log_sum_squares', 0)
-        if type(outarray[-4]) not in (int, long, float):
-            if verbose:
-                print >> sys.stderr, ("sum_squares_hi or log_sum is type %s" %
-                                      type(outarray[-4]))
-            continue
-        if type(outarray[-3]) not in (int, long, float):
-            if verbose:
-                msg = ("sum_squares_lo or log_sum_squares is type %s" %
-                       type(outarray[-3]))
-                print >> sys.stderr, msg
-            continue
-        outarray[-2] = histogram_sum
-        outarray[-1] = 1        # count
+
+        outarray[-6] = histogram_sum                        # sum
+        outarray[-5] = h_values.get('log_sum', -1)          # log_sum
+        outarray[-4] = h_values.get('log_sum_squares', -1)  # log_sum_squares
+        outarray[-3] = h_values.get('sum_squares_lo', -1)   # sum_squares_lo
+        outarray[-2] = h_values.get('sum_squares_hi', -1)   # sum_squares_hi
+        outarray[-1] = 1                                    # count
+
+        # by build date
+
+        filePath = (channel, majorVersion, h_name, "by-build-date")
+
         try:
-            context.write((channel, appVersion, h_name), {path: outarray})
+            context.write(filePath, {filterPathBD: {
+                'values':   outarray,
+                'buildId':  buildId,
+                'revision': revision
+            }})
         except TypeError:
-            dict_locations = [p for p, t in enumerate(path) if type(t) is dict]
+            dict_locations = [p for p, t in enumerate(filterPathBD) if type(t) is dict]
             if dict_locations:
                 field_names = ["buildDate", "reason", "appName", "OS",
                                "osVersion", "arch"]
                 dict_field_names = [field_names[i] for i in dict_locations]
-                msg = ("unable to hash the following `path` fields: %s" %
+                msg = ("unable to hash the following `filterPathBD` fields: %s" %
                        (' '.join(dict_field_names)))
             else:
                 msg = "TypeError when writing map output."
             if verbose:
                 print >> sys.stderr, msg
+
+        # by submission date
+        if skip_by_submission_date:
             continue
 
+        filePath = (channel, majorVersion, h_name, "by-submission-date")
+        try:
+            context.write(filePath, {filterPathSD: {
+                'values':   outarray,
+                'buildId':  buildId,
+                'revision': revision
+            }})
+        except TypeError:
+            dict_locations = [p for p, t in enumerate(filterPathSD) if type(t) is dict]
+            if dict_locations:
+                field_names = ["buildDate", "reason", "appName", "OS",
+                               "osVersion", "arch"]
+                dict_field_names = [field_names[i] for i in dict_locations]
+                msg = ("unable to hash the following `filterPathSD` fields: %s" %
+                       (' '.join(dict_field_names)))
+            else:
+                msg = "TypeError when writing map output."
+            if verbose:
+                print >> sys.stderr, msg
+
+    # by build date
+
     # Now read and output simple measures
-    simple_measures = payload.get('simpleMeasurements', None)
-    if simple_measures is None:
-        if verbose:
-            msg = "SimpleMeasures are missing..."
-            print >> sys.stderr, msg
-        return
-    for sm_name, sm_value in simple_measures.iteritems():
+    for sm_name, sm_value in payload.get('simpleMeasurements', {}).iteritems():
         # Handle cases where the value is a dictionary of simple measures
         if type(sm_value) == dict:
             for sub_name, sub_value in sm_value.iteritems():
-                map_simplemeasure(channel, appVersion, path,
-                                  sm_name + "_" + sub_name, sub_value, context)
+                map_simplemeasure(channel, majorVersion, "by-build-date", filterPathBD,
+                                  sm_name + "_" + sub_name, sub_value, context,
+                                  buildId, revision)
         else:
-            map_simplemeasure(channel, appVersion, path, sm_name, sm_value,
-                              context)
+            map_simplemeasure(channel, majorVersion, "by-build-date", filterPathBD,
+                              sm_name, sm_value, context, buildId, revision)
+
+    # by submission date
+    if skip_by_submission_date:
+        return
+
+    # Now read and output simple measures
+    for sm_name, sm_value in payload.get('simpleMeasurements', {}).iteritems():
+        # Handle cases where the value is a dictionary of simple measures
+        if type(sm_value) == dict:
+            for sub_name, sub_value in sm_value.iteritems():
+                map_simplemeasure(channel, majorVersion, "by-submission-date", filterPathSD,
+                                  sm_name + "_" + sub_name, sub_value, context,
+                                  buildId, revision)
+        else:
+            map_simplemeasure(channel, majorVersion, "by-submission-date", filterPathSD,
+                              sm_name, sm_value, context, buildId, revision)
 
 
 # Map a simple measure
-def map_simplemeasure(channel, appVersion, path, name, value, context):
+def map_simplemeasure(channel, majorVersion, byDateType, filterPath, name, value,
+                      context, buildId, revision):
     # Sanity check value
     if type(value) not in (int, long):
         if verbose:
@@ -234,76 +348,52 @@ def map_simplemeasure(channel, appVersion, path, name, value, context):
         return
 
     bucket = simple_measures_buckets[1]
-    outarray = [0] * (len(bucket) + 5)
+    outarray = [0] * (len(bucket) + 6)
     for i in reversed(range(0, len(bucket))):
         if value >= bucket[i]:
             outarray[i] = 1
             break
 
     log_val = math.log(math.fabs(value) + 1)
-    outarray[-4] = log_val              # log_sum
-    outarray[-3] = log_val * log_val    # log_sum_squares
-    outarray[-2] = value                # sum
-    outarray[-1] = 1                    # count
+    outarray[-6] = value                                # sum
+    outarray[-5] = log_val                              # log_sum
+    outarray[-4] = log_val * log_val                    # log_sum_squares
+    outarray[-3] = value * value                        # sum_squares_lo
+    outarray[-2] = 0                                    # sum_squares_hi
+    outarray[-1] = 1                                    # count
+
+    filePath = (channel, majorVersion, "SIMPLE_MEASURES_" + name.upper(), byDateType)
 
     # Output result array
-    context.write((channel, appVersion, "SIMPLE_MEASURES_" + name.upper()), 
-                  {path: outarray})
-
+    context.write(filePath, {filterPath: {
+        'values':   outarray,
+        'buildId':  buildId,
+        'revision': revision
+    }})
 
 def commonCombine(values):
     out = {}
     for d in values:
-        for filter_path, histogram in d.iteritems():
+        for filter_path, blob in d.iteritems():
             existing = out.get(filter_path, None)
             if existing is None:
-                out[filter_path] = histogram
-                continue
-            for y in range(0, len(histogram)):
-                existing[y] += (histogram[y] or 0)
+                out[filter_path] = HistogramAggregator(**blob)
+            else:
+                existing.merge(**blob)
+    for k, v in out.iteritems():
+        out[k] = v.dump()
     return out
 
 
 def combine(key, values, context):
-    out = commonCombine(values)
-    context.write(key, out)
-
+    context.write(key, commonCombine(values))
 
 def reduce(key, values, context):
-    out = commonCombine(values)
-    out_values = {}
-    h_name = key[2]
-    for (filter_path, histogram) in out.iteritems():
-        # first, discard any malformed (non int) entries, while allowing floats
-        # in the statistics
-        for i, val in enumerate(histogram):
-            T = type(val)
-            if T is not int:
-                if T is float:
-                    if i is len(histogram) - 3 or i is len(histogram) - 4:
-                        continue # allow elements of stats to be floats
-                msg = ("discarding %s - %s malformed type: %s on index %i" %
-                       ('/'.join(filter_path), h_name, T, i))
-                if verbose:
-                    print >> sys.stderr, msg
-                return
-        out_values["/".join(filter_path)] = histogram
-
-    if h_name.startswith("SIMPLE_MEASURES_"):
-        buckets = simple_measures_buckets[1];
-    else:
-        # histogram_specs lookup below is guaranteed to succeed, because of mapper
-        buckets = histogram_specs.get(h_name)[1]
-    final_out = {
-        'buckets': buckets,
-        'values': out_values
-    }
-    context.write("/".join(key), json.dumps(final_out))
-
-
-def output(path, results):
-    f = open(path, 'w')
-    for k, v in results:
-        f.write(k + "\t" + v + "\n")
+    out = {}
+    for filterPath, blob in commonCombine(values).iteritems():
+        out["/".join(filterPath)] = blob
+    context.write("/".join(key), json.dumps(out))
 
 setupjob = telemetryutils.setupjob
+
+

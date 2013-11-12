@@ -7,9 +7,9 @@ from datetime import datetime
 import math, sys
 import telemetryutils
 import jydoop
-import math
+import math, random
 
-verbose = True
+verbose = False
 
 ############################# HistogramAggregator
 
@@ -57,15 +57,15 @@ class HistogramAggregator:
                 self.values = values
                 self.buildId = buildId
             for i in xrange(0, len(values) - 6):
-                self.values[i] += values[i]
+                self.values[i] += values[i] or 0
             # Entries [-6:-1] may have -1 indicating missing entry
             for i in xrange(len(values) - 6, len(values) - 1):
                 # Missing entries are indicated with -1, we shouldn't add these up
                 if self.values[i] == -1 and values[i] == -1:
                     continue
-                self.values[i] += values[i]
+                self.values[i] += values[i] or 0
             # Last entry cannot be negative
-            self.values[-1] += values[-1]
+            self.values[-1] += values[-1] or 0
 
     def dump(self):
         return {
@@ -115,14 +115,34 @@ simple_measures_buckets =   (
 
 ############################# Jydoop Integration, data extraction
 
+def sanitize_and_put(context, filePath, filterPath, values, buildId, revision):
+    # Sanitize values
+    for i in xrange(0, len(values)):
+        if values[i] is None:
+            values[i] = 0
+        if type(values[i]) is float:
+            values[i] = long(values[i])
+        if type(values[i]) not in (int, long):
+            return
+    # Write sanitized output
+    context.write(filePath, {filterPath: {
+        'values':   values,
+        'buildId':  buildId,
+        'revision': revision
+    }})
+
 SPECS = "scripts/histogram_specs.json"
 histogram_specs = json.loads(jydoop.getResource(SPECS))
 
 def map(uid, line, context):
     global histogram_specs
+
+    #if random.random() > 0.01:
+    #    return
+
     payload = json.loads(line)
 
-    submissionDate = uid[2:10] # or uid[1:9]
+    submissionDate = uid[1:9] # or uid[1:9]
     try:
         i = payload['info']
         channel = i.get('appUpdateChannel', "too_old")
@@ -258,16 +278,17 @@ def map(uid, line, context):
         outarray[-2] = h_values.get('sum_squares_hi', -1)   # sum_squares_hi
         outarray[-1] = 1                                    # count
 
+        # Sanitize array:
+        for i in xrange(0, len(outarray)):
+            outarray[i] = outarray[i] or 0
+
         # by build date
 
         filePath = (channel, majorVersion, h_name, "by-build-date")
 
         try:
-            context.write(filePath, {filterPathBD: {
-                'values':   outarray,
-                'buildId':  buildId,
-                'revision': revision
-            }})
+            sanitize_and_put(context, filePath, filterPathBD, outarray,
+                             buildId, revision)
         except TypeError:
             dict_locations = [p for p, t in enumerate(filterPathBD) if type(t) is dict]
             if dict_locations:
@@ -287,6 +308,8 @@ def map(uid, line, context):
 
         filePath = (channel, majorVersion, h_name, "by-submission-date")
         try:
+            sanitize_and_put(context, filePath, filterPathSD, outarray,
+                             buildId, revision)
             context.write(filePath, {filterPathSD: {
                 'values':   outarray,
                 'buildId':  buildId,
@@ -358,18 +381,14 @@ def map_simplemeasure(channel, majorVersion, byDateType, filterPath, name, value
     outarray[-6] = value                                # sum
     outarray[-5] = log_val                              # log_sum
     outarray[-4] = log_val * log_val                    # log_sum_squares
-    outarray[-3] = value * value                        # sum_squares_lo
-    outarray[-2] = 0                                    # sum_squares_hi
+    outarray[-3] = -1                                   # sum_squares_lo
+    outarray[-2] = -1                                   # sum_squares_hi
     outarray[-1] = 1                                    # count
 
     filePath = (channel, majorVersion, "SIMPLE_MEASURES_" + name.upper(), byDateType)
 
     # Output result array
-    context.write(filePath, {filterPath: {
-        'values':   outarray,
-        'buildId':  buildId,
-        'revision': revision
-    }})
+    sanitize_and_put(context, filePath, filterPath, outarray, buildId, revision)
 
 def commonCombine(values):
     out = {}
